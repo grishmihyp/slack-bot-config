@@ -39,7 +39,10 @@ def create_pr(email, client_id, slack_user):
     updated_content = json.dumps(current_data, indent=4)
 
     # 3. Create a new branch
-    branch_name = f"update/{email.split('@')[0]}-{client_id}".replace(" ", "-")
+    import re
+    safe_email = re.sub(r'[^a-zA-Z0-9-]', '-', email.split('@')[0])
+    safe_client = re.sub(r'[^a-zA-Z0-9-]', '-', client_id)
+    branch_name = f"update/{safe_email}-{safe_client}"
     source = repo.get_branch(BASE_BRANCH)
     repo.create_git_ref(ref=f"refs/heads/{branch_name}", sha=source.commit.sha)
 
@@ -76,7 +79,11 @@ def handle_request(message, say, client):
     for line in text.splitlines():
         line = line.strip()
         if line.lower().startswith("email:"):
-            email = line.split(":", 1)[1].strip()
+            raw = line.split(":", 1)[1].strip()
+            # Strip Slack's mailto formatting: <mailto:user@co.com|user@co.com>
+            import re
+            match = re.search(r'mailto:([^\|>]+)', raw)
+            email = match.group(1) if match else raw
         elif line.lower().startswith("client_id:"):
             client_id = line.split(":", 1)[1].strip()
 
