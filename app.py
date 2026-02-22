@@ -23,6 +23,9 @@ repo = gh.get_repo(os.environ["GITHUB_REPO"])
 JSON_FILE_PATH = os.environ.get("JSON_FILE_PATH", "client-data.json")
 BASE_BRANCH = os.environ.get("BASE_BRANCH", "main")
 
+# ── Authorized approver (only this Slack user ID can approve/reject)
+APPROVER_SLACK_ID = os.environ.get("APPROVER_SLACK_ID", "")
+
 
 # ── Helper: read current JSON from GitHub ────────────────────────
 def get_current_data():
@@ -64,30 +67,64 @@ def create_pr(email, client_id, slack_user, description=None):
     return pr
 
 
-# ── Listen for ALL messages (including bot/workflow messages) ─────
+# ── Helper: build approval card blocks ───────────────────────────
+def approval_blocks(email, client_id, requested_by, description, pr):
+    details = f"🆕 *Production Access Request*\n\n*Email:* `{email}`\n*Client ID:* `{client_id}`"
+    if requested_by:
+        details += f"\n*Requested By:* {requested_by}"
+    if description:
+        details += f"\n*Additional Comments:* {description}"
+    details += f"\n*PR:* <{pr.html_url}|View on GitHub>"
+
+    return [
+        {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": details}
+        },
+        {
+            "type": "actions",
+            "block_id": f"approval_{pr.number}",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "✅ Approve"},
+                    "style": "primary",
+                    "action_id": "approve_pr",
+                    "value": str(pr.number)
+                },
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "❌ Decline"},
+                    "style": "danger",
+                    "action_id": "reject_pr",
+                    "value": str(pr.number)
+                }
+            ]
+        }
+    ]
+
+
+# ── Listen for workflow messages ──────────────────────────────────
 @app.event("message")
 def handle_all_messages(body, say, client):
     event = body.get("event", {})
     text = event.get("text", "")
-    subtype = event.get("subtype", "")
 
-    # Only process messages that contain "email:"
     if "email id:" not in text.lower():
         return
 
-    # Get user — for bot messages (Workflow Builder), use the channel instead
     user = event.get("user") or event.get("bot_id", "workflow")
+    channel = event.get("channel")
+    thread_ts = event.get("ts")  # reply in thread of this message
 
     email, client_id, requested_by, description = None, None, None, None
-    import re
 
     for line in text.splitlines():
         line = line.strip()
         if not line or ':' not in line:
             continue
-
         key, _, value = line.partition(':')
-        key_clean = re.sub(r'[\s_\-]+', '', key).lower()  # remove spaces/underscores/dashes
+        key_clean = re.sub(r'[\s_\-]+', '', key).lower()
         value = value.strip()
 
         if key_clean in ('emailid', 'email'):
@@ -103,192 +140,22 @@ def handle_all_messages(body, say, client):
     if not email or not client_id:
         return
 
-    channel = event.get("channel")
-
-    # Always post as a new message with a unique timestamp marker
-    client.chat_postMessage(
-        channel=channel,
-        text=f"⏳ Creating a PR for `{email}` with client ID `{client_id}`..."
-    )
-
     try:
         pr = create_pr(email, client_id, requested_by or user, description)
 
-        # Build the PR details text
-        details = f"✅ *PR Ready for Review*\n*Email:* `{email}`\n*Client ID:* `{client_id}`"
-        if requested_by:
-            details += f"\n*Requested By:* {requested_by}"
-        if description:
-            details += f"\n*Description:* {description}"
-        details += f"\n*PR:* <{pr.html_url}|View on GitHub>"
-
+        # Tag the approver in thread: "Hey @grishmi, a request has been raised"
+        mention = f"<@{APPROVER_SLACK_ID}>" if APPROVER_SLACK_ID else "admin"
         client.chat_postMessage(
             channel=channel,
-            blocks=[
-                {
-                    "type": "section",
-                    "text": {
-                        "type": "mrkdwn",
-                        "text": details
-                    }
-                },
-                {
-                    "type": "actions",
-                    "block_id": f"approval_{pr.number}",
-                    "elements": [
-                        {
-                            "type": "button",
-                            "text": {"type": "plain_text", "text": "✅ Approve & Merge"},
-                            "style": "primary",
-                            "action_id": "approve_pr",
-                            "value": str(pr.number)
-                        },
-                        {
-                            "type": "button",
-                            "text": {"type": "plain_text", "text": "❌ Reject"},
-                            "style": "danger",
-                            "action_id": "reject_pr",
-                            "value": str(pr.number)
-                        }
-                    ]
-                }
-            ]
+            thread_ts=thread_ts,
+            text=f"Hey {mention}, a production access request has been raised. Please review and approve or decline below.",
+            blocks=approval_blocks(email, client_id, requested_by, description, pr)
         )
+
     except Exception as e:
         client.chat_postMessage(
             channel=channel,
-            text=f"❌ Something went wrong creating the PR: `{str(e)}`"
-        )
-
-
-# ── Slash command to post the pinned "Submit Request" button ─────
-# Run /setup-request-button once in your channel to pin the button
-@app.command("/setup-request-button")
-def post_request_button(ack, body, client):
-    ack()
-    channel_id = body["channel_id"]
-
-    result = client.chat_postMessage(
-        channel=channel_id,
-        blocks=[
-            {
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": "*📋 Client Access Request*\nClick the button below to submit a new client request. A PR will be created and sent for approval."
-                }
-            },
-            {
-                "type": "actions",
-                "elements": [
-                    {
-                        "type": "button",
-                        "text": {"type": "plain_text", "text": "📝 Submit Request", "emoji": True},
-                        "style": "primary",
-                        "action_id": "open_request_modal"
-                    }
-                ]
-            }
-        ]
-    )
-
-    # Pin the message to the channel
-    client.pins_add(channel=channel_id, timestamp=result["ts"])
-
-
-# ── Handle "Submit Request" button → open modal ──────────────────
-@app.action("open_request_modal")
-def open_modal(ack, body, client):
-    ack()
-    client.views_open(
-        trigger_id=body["trigger_id"],
-        view={
-            "type": "modal",
-            "callback_id": "submit_request_modal",
-            "title": {"type": "plain_text", "text": "Client Access Request"},
-            "submit": {"type": "plain_text", "text": "Submit"},
-            "close": {"type": "plain_text", "text": "Cancel"},
-            "private_metadata": body["channel"]["id"],
-            "blocks": [
-                {
-                    "type": "input",
-                    "block_id": "email_block",
-                    "label": {"type": "plain_text", "text": "Email Address"},
-                    "element": {
-                        "type": "plain_text_input",
-                        "action_id": "email_input",
-                        "placeholder": {"type": "plain_text", "text": "user@company.com"}
-                    }
-                },
-                {
-                    "type": "input",
-                    "block_id": "client_id_block",
-                    "label": {"type": "plain_text", "text": "Client ID"},
-                    "element": {
-                        "type": "plain_text_input",
-                        "action_id": "client_id_input",
-                        "placeholder": {"type": "plain_text", "text": "e.g. HV"}
-                    }
-                }
-            ]
-        }
-    )
-
-
-# ── Handle modal submission ───────────────────────────────────────
-@app.view("submit_request_modal")
-def handle_modal_submit(ack, body, client, say):
-    ack()
-
-    values = body["view"]["state"]["values"]
-    email = values["email_block"]["email_input"]["value"].strip()
-    client_id = values["client_id_block"]["client_id_input"]["value"].strip()
-    user = body["user"]["id"]
-    channel_id = body["view"]["private_metadata"]
-
-    client.chat_postMessage(
-        channel=channel_id,
-        text=f"⏳ <@{user}> submitted a request for `{email}` with client ID `{client_id}`. Creating PR..."
-    )
-
-    try:
-        pr = create_pr(email, client_id, user)
-
-        client.chat_postMessage(
-            channel=channel_id,
-            blocks=[
-                {
-                    "type": "section",
-                    "text": {
-                        "type": "mrkdwn",
-                        "text": f"✅ *PR Ready for Review*\n*Email:* `{email}`\n*Client ID:* `{client_id}`\n*Requested by:* <@{user}>\n*PR:* <{pr.html_url}|View on GitHub>"
-                    }
-                },
-                {
-                    "type": "actions",
-                    "block_id": f"approval_{pr.number}",
-                    "elements": [
-                        {
-                            "type": "button",
-                            "text": {"type": "plain_text", "text": "✅ Approve & Merge"},
-                            "style": "primary",
-                            "action_id": "approve_pr",
-                            "value": str(pr.number)
-                        },
-                        {
-                            "type": "button",
-                            "text": {"type": "plain_text", "text": "❌ Reject"},
-                            "style": "danger",
-                            "action_id": "reject_pr",
-                            "value": str(pr.number)
-                        }
-                    ]
-                }
-            ]
-        )
-    except Exception as e:
-        client.chat_postMessage(
-            channel=channel_id,
+            thread_ts=thread_ts,
             text=f"❌ Something went wrong creating the PR: `{str(e)}`"
         )
 
@@ -297,16 +164,30 @@ def handle_modal_submit(ack, body, client, say):
 @app.action("approve_pr")
 def handle_approve(ack, body, client):
     ack()
-    pr_number = int(body["actions"][0]["value"])
     approver = body["user"]["id"]
+    channel = body["channel"]["id"]
+    ts = body["message"]["ts"]
+    thread_ts = body["message"].get("thread_ts", ts)
+    pr_number = int(body["actions"][0]["value"])
+
+    # ── Restrict to authorized approver only ──
+    if APPROVER_SLACK_ID and approver != APPROVER_SLACK_ID:
+        client.chat_postEphemeral(
+            channel=channel,
+            user=approver,
+            thread_ts=thread_ts,
+            text="🚫 You're not authorized to approve this request."
+        )
+        return
 
     try:
         pr = repo.get_pull(pr_number)
         pr.merge(merge_method="squash")
 
+        # Update the approval card to show approved state
         client.chat_update(
-            channel=body["channel"]["id"],
-            ts=body["message"]["ts"],
+            channel=channel,
+            ts=ts,
             blocks=[
                 {
                     "type": "section",
@@ -317,49 +198,57 @@ def handle_approve(ack, body, client):
                 }
             ]
         )
-        client.chat_postMessage(
-            channel=body["channel"]["id"],
-            text=f"🎉 PR #{pr_number} merged successfully by <@{approver}>!"
-        )
     except Exception as e:
         client.chat_postMessage(
-            channel=body["channel"]["id"],
+            channel=channel,
+            thread_ts=thread_ts,
             text=f"❌ Failed to merge PR #{pr_number}: `{str(e)}`"
         )
 
 
-# ── Reject button ─────────────────────────────────────────────────
+# ── Decline button ────────────────────────────────────────────────
 @app.action("reject_pr")
 def handle_reject(ack, body, client):
     ack()
-    pr_number = int(body["actions"][0]["value"])
     rejecter = body["user"]["id"]
+    channel = body["channel"]["id"]
+    ts = body["message"]["ts"]
+    thread_ts = body["message"].get("thread_ts", ts)
+    pr_number = int(body["actions"][0]["value"])
+
+    # ── Restrict to authorized approver only ──
+    if APPROVER_SLACK_ID and rejecter != APPROVER_SLACK_ID:
+        client.chat_postEphemeral(
+            channel=channel,
+            user=rejecter,
+            thread_ts=thread_ts,
+            text="🚫 You're not authorized to decline this request."
+        )
+        return
 
     try:
         pr = repo.get_pull(pr_number)
         pr.edit(state="closed")
 
+        # Update the approval card to show declined state
         client.chat_update(
-            channel=body["channel"]["id"],
-            ts=body["message"]["ts"],
+            channel=channel,
+            ts=ts,
             blocks=[
                 {
                     "type": "section",
                     "text": {
                         "type": "mrkdwn",
-                        "text": f"❌ *Rejected* by <@{rejecter}>\n*PR:* {pr.title}"
+                        "text": f"❌ *Declined* by <@{rejecter}>\n*PR:* {pr.title}"
                     }
                 }
             ]
         )
-        client.chat_postMessage(
-            channel=body["channel"]["id"],
-            text=f"🚫 PR #{pr_number} rejected by <@{rejecter}>."
-        )
     except Exception as e:
         client.chat_postMessage(
-            channel=body["channel"]["id"],
-            text=f"❌ Failed to reject PR #{pr_number}: `{str(e)}`"
+            channel=channel,
+            thread_ts=thread_ts,
+            text=f"❌ Failed to decline PR #{pr_number}: `{str(e)}`"
         )
 
 
