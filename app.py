@@ -221,7 +221,7 @@ def handle_approve(ack, body, client):
                     "type": "section",
                     "text": {
                         "type": "mrkdwn",
-                        "text": f"✅ *Approved & Merged* by <@{approver}>\n*PR:* {pr.title}"
+                        "text": f"✅ Approved by <@{approver}>"
                     }
                 }
             ]
@@ -267,7 +267,7 @@ def handle_reject(ack, body, client):
                     "type": "section",
                     "text": {
                         "type": "mrkdwn",
-                        "text": f"❌ *Declined* by <@{rejecter}>\n*PR:* {pr.title}"
+                        "text": f"❌ Declined by <@{rejecter}>"
                     }
                 }
             ]
@@ -287,7 +287,8 @@ def slack_events():
 
 @flask_app.route("/", methods=["GET"])
 def health():
-    return "Bot is running ✅", 200
+    approver = os.environ.get("APPROVER_SLACK_ID", "NOT SET")
+    return f"Bot is running ✅ | APPROVER_SLACK_ID: {approver}", 200
 
 
 if __name__ == "__main__":
