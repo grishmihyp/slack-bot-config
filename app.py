@@ -69,7 +69,8 @@ def create_pr(email, client_id, slack_user, description=None):
 
 # ── Helper: build approval card blocks ───────────────────────────
 def approval_blocks(email, client_id, requested_by, description, pr):
-    details = f"🆕 *Production Access Request*\n\n*Email:* `{email}`\n*Client ID:* `{client_id}`"
+    mention = f"<@{APPROVER_SLACK_ID}>" if APPROVER_SLACK_ID else "admin"
+    details = f"🆕 *Production Access Request*\n\nHey {mention}, a publish to production access request has been raised.\n\n*Email:* `{email}`\n*Client ID:* `{client_id}`"
     if requested_by:
         details += f"\n*Requested By:* {requested_by}"
     if description:
@@ -143,19 +144,46 @@ def handle_all_messages(body, say, client):
     try:
         pr = create_pr(email, client_id, requested_by or user, description)
 
-        # Tag the approver in thread: "Hey @grishmi, a request has been raised"
         mention = f"<@{APPROVER_SLACK_ID}>" if APPROVER_SLACK_ID else "admin"
+
+        # Post in thread of the workflow message
         client.chat_postMessage(
             channel=channel,
             thread_ts=thread_ts,
-            text=f"Hey {mention}, a production access request has been raised. Please review and approve or decline below.",
-            blocks=approval_blocks(email, client_id, requested_by, description, pr)
+            blocks=[
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f"Hey {mention}, a publish to production access request has been raised. Please review and approve or decline."
+                    }
+                },
+                {
+                    "type": "actions",
+                    "block_id": f"approval_{pr.number}",
+                    "elements": [
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": "✅ Approve"},
+                            "style": "primary",
+                            "action_id": "approve_pr",
+                            "value": str(pr.number)
+                        },
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": "❌ Decline"},
+                            "style": "danger",
+                            "action_id": "reject_pr",
+                            "value": str(pr.number)
+                        }
+                    ]
+                }
+            ]
         )
 
     except Exception as e:
         client.chat_postMessage(
             channel=channel,
-            thread_ts=thread_ts,
             text=f"❌ Something went wrong creating the PR: `{str(e)}`"
         )
 
