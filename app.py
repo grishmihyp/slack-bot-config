@@ -1,4 +1,5 @@
 import os
+import re
 import json
 from slack_bolt import App
 from slack_bolt.adapter.flask import SlackRequestHandler
@@ -18,7 +19,7 @@ handler = SlackRequestHandler(app)
 
 # ── GitHub setup ─────────────────────────────────────────────────
 gh = Github(os.environ["GITHUB_TOKEN"])
-repo = gh.get_repo(os.environ["GITHUB_REPO"])  # e.g. "yourorg/client-config"
+repo = gh.get_repo(os.environ["GITHUB_REPO"])
 JSON_FILE_PATH = os.environ.get("JSON_FILE_PATH", "client-data.json")
 BASE_BRANCH = os.environ.get("BASE_BRANCH", "main")
 
@@ -31,22 +32,17 @@ def get_current_data():
 
 # ── Helper: create branch + commit + PR ──────────────────────────
 def create_pr(email, client_id, slack_user):
-    # 1. Read current file
     current_data, file_sha = get_current_data()
-
-    # 2. Add new entry
     current_data[email] = [client_id]
     updated_content = json.dumps(current_data, indent=4)
 
-    # 3. Create a new branch
-    import re
     safe_email = re.sub(r'[^a-zA-Z0-9-]', '-', email.split('@')[0])
     safe_client = re.sub(r'[^a-zA-Z0-9-]', '-', client_id)
     branch_name = f"update/{safe_email}-{safe_client}"
+
     source = repo.get_branch(BASE_BRANCH)
     repo.create_git_ref(ref=f"refs/heads/{branch_name}", sha=source.commit.sha)
 
-    # 4. Commit updated file to new branch
     repo.update_file(
         path=JSON_FILE_PATH,
         message=f"Add {email} with client ID {client_id}",
@@ -55,7 +51,6 @@ def create_pr(email, client_id, slack_user):
         branch=branch_name
     )
 
-    # 5. Open PR
     pr = repo.create_pull(
         title=f"Add client: {email} [{client_id}]",
         body=f"Requested by <@{slack_user}> via Slack.\n\n**Email:** {email}\n**Client ID:** {client_id}",
@@ -65,39 +60,100 @@ def create_pr(email, client_id, slack_user):
     return pr
 
 
-# ── Slack: listen for messages containing "email:" ───────────────
-# Users post in this format:
-#   email: user@company.com
-#   client_id: HV
-@app.message("email:")
-def handle_request(message, say, client):
-    text = message.get("text", "")
-    user = message.get("user")
+# ── Slash command: /setup-channel ────────────────────────────────
+# Run this ONCE in your channel to post + pin the Submit button
+@app.command("/setup-channel")
+def setup_channel(ack, body, client):
+    ack()
+    channel_id = body["channel_id"]
 
-    # Parse email and client_id from message
-    email, client_id = None, None
-    for line in text.splitlines():
-        line = line.strip()
-        if line.lower().startswith("email:"):
-            raw = line.split(":", 1)[1].strip()
-            # Strip Slack's mailto formatting: <mailto:user@co.com|user@co.com>
-            import re
-            match = re.search(r'mailto:([^\|>]+)', raw)
-            email = match.group(1) if match else raw
-        elif line.lower().startswith("client_id:"):
-            client_id = line.split(":", 1)[1].strip()
+    result = client.chat_postMessage(
+        channel=channel_id,
+        blocks=[
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": "*📋 Client Onboarding Requests*\nClick the button below to submit a new client request. An admin will review and approve it."
+                }
+            },
+            {
+                "type": "actions",
+                "elements": [
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": "➕ Submit Request", "emoji": True},
+                        "style": "primary",
+                        "action_id": "open_request_modal"
+                    }
+                ]
+            }
+        ]
+    )
+    # Pin the message so it stays at the top
+    client.pins_add(channel=channel_id, timestamp=result["ts"])
 
-    if not email or not client_id:
-        say(f"<@{user}> ⚠️ Please use this format:\n```email: user@company.com\nclient_id: HV```")
-        return
 
-    say(f"⏳ Got it <@{user}>! Creating a PR for `{email}` with client ID `{client_id}`...")
+# ── Action: open modal when button clicked ───────────────────────
+@app.action("open_request_modal")
+def open_modal(ack, body, client):
+    ack()
+    client.views_open(
+        trigger_id=body["trigger_id"],
+        view={
+            "type": "modal",
+            "callback_id": "submit_request",
+            "title": {"type": "plain_text", "text": "Submit Client Request"},
+            "submit": {"type": "plain_text", "text": "Submit"},
+            "close": {"type": "plain_text", "text": "Cancel"},
+            "private_metadata": body["channel"]["id"],
+            "blocks": [
+                {
+                    "type": "input",
+                    "block_id": "email_block",
+                    "label": {"type": "plain_text", "text": "Client Email"},
+                    "element": {
+                        "type": "plain_text_input",
+                        "action_id": "email_input",
+                        "placeholder": {"type": "plain_text", "text": "user@company.com"}
+                    }
+                },
+                {
+                    "type": "input",
+                    "block_id": "client_id_block",
+                    "label": {"type": "plain_text", "text": "Client ID"},
+                    "element": {
+                        "type": "plain_text_input",
+                        "action_id": "client_id_input",
+                        "placeholder": {"type": "plain_text", "text": "e.g. HV"}
+                    }
+                }
+            ]
+        }
+    )
+
+
+# ── Modal submission ──────────────────────────────────────────────
+@app.view("submit_request")
+def handle_submission(ack, body, client, say):
+    ack()
+
+    values = body["view"]["state"]["values"]
+    email = values["email_block"]["email_input"]["value"].strip()
+    client_id = values["client_id_block"]["client_id_input"]["value"].strip()
+    user = body["user"]["id"]
+    channel_id = body["view"]["private_metadata"]
+
+    client.chat_postMessage(
+        channel=channel_id,
+        text=f"⏳ <@{user}> submitted a request for `{email}` — creating PR..."
+    )
 
     try:
         pr = create_pr(email, client_id, user)
 
-        # Post approval card with buttons
-        say(
+        client.chat_postMessage(
+            channel=channel_id,
             blocks=[
                 {
                     "type": "section",
@@ -129,12 +185,15 @@ def handle_request(message, say, client):
             ]
         )
     except Exception as e:
-        say(f"❌ Something went wrong creating the PR: `{str(e)}`")
+        client.chat_postMessage(
+            channel=channel_id,
+            text=f"❌ Something went wrong creating the PR: `{str(e)}`"
+        )
 
 
-# ── Slack: Approve button ─────────────────────────────────────────
+# ── Approve button ────────────────────────────────────────────────
 @app.action("approve_pr")
-def handle_approve(ack, body, say, client):
+def handle_approve(ack, body, client):
     ack()
     pr_number = int(body["actions"][0]["value"])
     approver = body["user"]["id"]
@@ -156,14 +215,20 @@ def handle_approve(ack, body, say, client):
                 }
             ]
         )
-        say(f"🎉 PR #{pr_number} merged successfully by <@{approver}>!")
+        client.chat_postMessage(
+            channel=body["channel"]["id"],
+            text=f"🎉 PR #{pr_number} merged successfully by <@{approver}>!"
+        )
     except Exception as e:
-        say(f"❌ Failed to merge PR #{pr_number}: `{str(e)}`")
+        client.chat_postMessage(
+            channel=body["channel"]["id"],
+            text=f"❌ Failed to merge PR #{pr_number}: `{str(e)}`"
+        )
 
 
-# ── Slack: Reject button ──────────────────────────────────────────
+# ── Reject button ─────────────────────────────────────────────────
 @app.action("reject_pr")
-def handle_reject(ack, body, say, client):
+def handle_reject(ack, body, client):
     ack()
     pr_number = int(body["actions"][0]["value"])
     rejecter = body["user"]["id"]
@@ -185,9 +250,15 @@ def handle_reject(ack, body, say, client):
                 }
             ]
         )
-        say(f"🚫 PR #{pr_number} rejected by <@{rejecter}>.")
+        client.chat_postMessage(
+            channel=body["channel"]["id"],
+            text=f"🚫 PR #{pr_number} rejected by <@{rejecter}>."
+        )
     except Exception as e:
-        say(f"❌ Failed to reject PR #{pr_number}: `{str(e)}`")
+        client.chat_postMessage(
+            channel=body["channel"]["id"],
+            text=f"❌ Failed to reject PR #{pr_number}: `{str(e)}`"
+        )
 
 
 # ── Flask routes ──────────────────────────────────────────────────
