@@ -31,7 +31,7 @@ def get_current_data():
 
 
 # ── Helper: create branch + commit + PR ──────────────────────────
-def create_pr(email, client_id, slack_user):
+def create_pr(email, client_id, slack_user, description=None):
     current_data, file_sha = get_current_data()
     current_data[email] = [client_id]
     updated_content = json.dumps(current_data, indent=4)
@@ -51,19 +51,120 @@ def create_pr(email, client_id, slack_user):
         branch=branch_name
     )
 
+    pr_body = f"Requested by {slack_user} via Slack.\n\n**Email:** {email}\n**Client ID:** {client_id}"
+    if description:
+        pr_body += f"\n**Description:** {description}"
+
     pr = repo.create_pull(
         title=f"Add client: {email} [{client_id}]",
-        body=f"Requested by <@{slack_user}> via Slack.\n\n**Email:** {email}\n**Client ID:** {client_id}",
+        body=pr_body,
         head=branch_name,
         base=BASE_BRANCH
     )
     return pr
 
 
-# ── Slash command: /setup-channel ────────────────────────────────
-# Run this ONCE in your channel to post + pin the Submit button
-@app.command("/setup-channel")
-def setup_channel(ack, body, client):
+# ── Listen for ALL messages (including bot/workflow messages) ─────
+@app.event("message")
+def handle_all_messages(body, say, client):
+    event = body.get("event", {})
+    text = event.get("text", "")
+    subtype = event.get("subtype", "")
+
+    # Only process messages that contain "email:"
+    if "email id:" not in text.lower():
+        return
+
+    # Get user — for bot messages (Workflow Builder), use the channel instead
+    user = event.get("user") or event.get("bot_id", "workflow")
+
+    email, client_id, requested_by, description = None, None, None, None
+    import re
+
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or ':' not in line:
+            continue
+
+        key, _, value = line.partition(':')
+        key_clean = re.sub(r'[\s_\-]+', '', key).lower()  # remove spaces/underscores/dashes
+        value = value.strip()
+
+        if key_clean in ('emailid', 'email'):
+            match = re.search(r'mailto:([^\|>]+)', value)
+            email = match.group(1) if match else value
+        elif key_clean in ('clientid', 'client'):
+            client_id = value
+        elif key_clean in ('requestedby', 'requestby'):
+            requested_by = value
+        elif key_clean in ('description', 'additionalcomments', 'comments', 'comment'):
+            description = value
+
+    if not email or not client_id:
+        return
+
+    channel = event.get("channel")
+
+    # Always post as a new message with a unique timestamp marker
+    client.chat_postMessage(
+        channel=channel,
+        text=f"⏳ Creating a PR for `{email}` with client ID `{client_id}`..."
+    )
+
+    try:
+        pr = create_pr(email, client_id, requested_by or user, description)
+
+        # Build the PR details text
+        details = f"✅ *PR Ready for Review*\n*Email:* `{email}`\n*Client ID:* `{client_id}`"
+        if requested_by:
+            details += f"\n*Requested By:* {requested_by}"
+        if description:
+            details += f"\n*Description:* {description}"
+        details += f"\n*PR:* <{pr.html_url}|View on GitHub>"
+
+        client.chat_postMessage(
+            channel=channel,
+            blocks=[
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": details
+                    }
+                },
+                {
+                    "type": "actions",
+                    "block_id": f"approval_{pr.number}",
+                    "elements": [
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": "✅ Approve & Merge"},
+                            "style": "primary",
+                            "action_id": "approve_pr",
+                            "value": str(pr.number)
+                        },
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": "❌ Reject"},
+                            "style": "danger",
+                            "action_id": "reject_pr",
+                            "value": str(pr.number)
+                        }
+                    ]
+                }
+            ]
+        )
+    except Exception as e:
+        client.chat_postMessage(
+            channel=channel,
+            text=f"❌ Something went wrong creating the PR: `{str(e)}`"
+        )
+
+
+# ── Slash command to post the pinned "Submit Request" button ─────
+# Run /setup-request-button once in your channel to pin the button
+@app.command("/setup-request-button")
+def post_request_button(ack, body, client):
     ack()
     channel_id = body["channel_id"]
 
@@ -74,7 +175,7 @@ def setup_channel(ack, body, client):
                 "type": "section",
                 "text": {
                     "type": "mrkdwn",
-                    "text": "*📋 Client Onboarding Requests*\nClick the button below to submit a new client request. An admin will review and approve it."
+                    "text": "*📋 Client Access Request*\nClick the button below to submit a new client request. A PR will be created and sent for approval."
                 }
             },
             {
@@ -82,7 +183,7 @@ def setup_channel(ack, body, client):
                 "elements": [
                     {
                         "type": "button",
-                        "text": {"type": "plain_text", "text": "➕ Submit Request", "emoji": True},
+                        "text": {"type": "plain_text", "text": "📝 Submit Request", "emoji": True},
                         "style": "primary",
                         "action_id": "open_request_modal"
                     }
@@ -90,11 +191,12 @@ def setup_channel(ack, body, client):
             }
         ]
     )
-    # Pin the message so it stays at the top
+
+    # Pin the message to the channel
     client.pins_add(channel=channel_id, timestamp=result["ts"])
 
 
-# ── Action: open modal when button clicked ───────────────────────
+# ── Handle "Submit Request" button → open modal ──────────────────
 @app.action("open_request_modal")
 def open_modal(ack, body, client):
     ack()
@@ -102,8 +204,8 @@ def open_modal(ack, body, client):
         trigger_id=body["trigger_id"],
         view={
             "type": "modal",
-            "callback_id": "submit_request",
-            "title": {"type": "plain_text", "text": "Submit Client Request"},
+            "callback_id": "submit_request_modal",
+            "title": {"type": "plain_text", "text": "Client Access Request"},
             "submit": {"type": "plain_text", "text": "Submit"},
             "close": {"type": "plain_text", "text": "Cancel"},
             "private_metadata": body["channel"]["id"],
@@ -111,7 +213,7 @@ def open_modal(ack, body, client):
                 {
                     "type": "input",
                     "block_id": "email_block",
-                    "label": {"type": "plain_text", "text": "Client Email"},
+                    "label": {"type": "plain_text", "text": "Email Address"},
                     "element": {
                         "type": "plain_text_input",
                         "action_id": "email_input",
@@ -133,9 +235,9 @@ def open_modal(ack, body, client):
     )
 
 
-# ── Modal submission ──────────────────────────────────────────────
-@app.view("submit_request")
-def handle_submission(ack, body, client, say):
+# ── Handle modal submission ───────────────────────────────────────
+@app.view("submit_request_modal")
+def handle_modal_submit(ack, body, client, say):
     ack()
 
     values = body["view"]["state"]["values"]
@@ -146,7 +248,7 @@ def handle_submission(ack, body, client, say):
 
     client.chat_postMessage(
         channel=channel_id,
-        text=f"⏳ <@{user}> submitted a request for `{email}` — creating PR..."
+        text=f"⏳ <@{user}> submitted a request for `{email}` with client ID `{client_id}`. Creating PR..."
     )
 
     try:
